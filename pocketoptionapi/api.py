@@ -11,6 +11,7 @@ import requests
 import ssl
 import atexit
 from collections import deque
+from loguru import logger
 from pocketoptionapi.ws.client import WebsocketClient
 from pocketoptionapi.ws.channels.get_balances import *
 from pocketoptionapi.ws.channels.ssid import Ssid
@@ -21,7 +22,6 @@ from pocketoptionapi.ws.objects.candles import Candles
 import pocketoptionapi.global_value as global_value
 from pocketoptionapi.ws.channels.change_symbol import ChangeSymbol
 from collections import defaultdict
-from pocketoptionapi.ws.objects.time_sync import TimeSynchronizer
 
 def nested_dict(n, type):
     if n == 1:
@@ -34,7 +34,6 @@ class PocketOptionAPI(object):
 
     socket_option_opened = {}
     time_sync = TimeSync()
-    sync = TimeSynchronizer()
     timesync = None
     candles = Candles()
     api_option_init_all_result = []
@@ -117,75 +116,88 @@ class PocketOptionAPI(object):
     def GetPayoutData(self):
         return global_value.PayoutData
 
-    def send_websocket_request(self, name, msg, request_id="", no_force_send=True):
-        """Envia requisição websocket para o servidor da Pocket Option.
+    async def send_websocket_request(self, name, msg, request_id="", no_force_send=True):
+        """Envia requisição websocket de forma assíncrona.
 
         :param no_force_send: Se não deve forçar o envio
         :param request_id: ID da requisição
         :param str name: Nome da requisição websocket
         :param dict msg: Mensagem da requisição websocket
         """
+        return await self.async_send_websocket_request(name, msg, request_id, no_force_send)
+
+    async def async_send_websocket_request(self, name, msg, request_id="", no_force_send=True):
+        """Versão assíncrona do send_websocket_request com locks async-safe."""
         logger = logging.getLogger(__name__)
 
         data = f'42{json.dumps(msg)}'
 
-        while (global_value.ssl_Mutual_exclusion or global_value.ssl_Mutual_exclusion_write) and no_force_send:
-            pass
-        global_value.ssl_Mutual_exclusion_write = True
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        loop.run_until_complete(self.websocket.send_message(data))
-
+        # Usar locks async-safe quando disponíveis, senão fallback para legacy
+        try:
+            write_lock = await global_value.get_write_lock()
+            async with write_lock:
+                if self.websocket and hasattr(self.websocket, 'send_message'):
+                    await self.websocket.send_message(data)
+                else:
+                    logger.error("WebSocket não disponível para envio")
+        except Exception as e:
+            # Fallback para método legacy se locks async não funcionarem
+            logger.warning(f"Fallback para método legacy: {e}")
+            while (global_value.ssl_Mutual_exclusion or global_value.ssl_Mutual_exclusion_write) and no_force_send:
+                await asyncio.sleep(0.001)
+            
+            global_value.ssl_Mutual_exclusion_write = True
+            try:
+                if self.websocket and hasattr(self.websocket, 'send_message'):
+                    await self.websocket.send_message(data)
+            finally:
+                global_value.ssl_Mutual_exclusion_write = False
+        
         logger.debug(data)
-        global_value.ssl_Mutual_exclusion_write = False
 
-    def start_websocket(self):
+    async def start_websocket(self):
+        """Inicia websocket de forma assíncrona."""
+        return await self._async_start_websocket()
+    
+    async def _async_start_websocket(self):
+        """Versão assíncrona interna do start_websocket"""
         global_value.websocket_is_connected = False
         global_value.check_websocket_if_error = False
         global_value.websocket_error_reason = None
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        loop.run_until_complete(self.websocket.connect())
-        loop.run_forever()
-
-        while True:
-            try:
+        try:
+            await self.websocket.connect()
+            
+            timeout = 10
+            start_time = time.time()
+            
+            while not global_value.websocket_is_connected and (time.time() - start_time) < timeout:
                 if global_value.check_websocket_if_error:
                     return False, global_value.websocket_error_reason
-                if global_value.websocket_is_connected is False:
-                    return False, "Conexão websocket fechada."
-                elif global_value.websocket_is_connected is True:
-                    return True, None
-            except:
-                pass
+                await asyncio.sleep(0.1)
+            
+            if global_value.websocket_is_connected:
+                return True, None
+            else:
+                return False, "Timeout na conexão websocket"
+                
+        except Exception as e:
+            return False, f"Erro na conexão: {e}"
 
-    def connect(self):
-        """Método para conexão com a API da Pocket Option."""
-
-        global_value.ssl_Mutual_exclusion = False
-        global_value.ssl_Mutual_exclusion_write = False
-
-        check_websocket, websocket_reason = self.start_websocket()
-
-        if not check_websocket:
-            return check_websocket, websocket_reason
-
-        self.time_sync.server_timestamps = None
-        while True:
-            try:
-                if self.time_sync.server_timestamps is not None:
-                    break
-            except:
-                pass
-        return True, None
+    async def connect(self):
+        """Conexão assíncrona com a API."""
+        return await self.async_connect()
 
     async def close(self, error=None):
-        await self.websocket.on_close(error)
-        self.websocket_thread.join()
+        try:
+            if self.websocket and hasattr(self.websocket, 'websocket') and self.websocket.websocket:
+                await self.websocket.websocket.close()
+                logger.debug("🔌 WebSocket fechado pelo método close")
+            if self.websocket_thread and self.websocket_thread.is_alive():
+                self.websocket_thread.join(timeout=5.0)
+                logger.debug("🧵 Thread WebSocket finalizada")
+        except Exception as e:
+            logger.warning(f"⚠️ Aviso ao fechar no método close: {e}")
 
     def websocket_alive(self):
         return self.websocket_thread.is_alive()
@@ -203,6 +215,11 @@ class PocketOptionAPI(object):
     def buyv3(self):
         return Buyv3(self)
 
+    async def async_buyv3(self, amount, active, action, expirations, req_id):
+        """Versão assíncrona do buyv3"""
+        buyv3_instance = Buyv3(self)
+        await buyv3_instance.async_call(amount, active, action, expirations, req_id)
+
     @property
     def getcandles(self):
         """Propriedade para obter o canal websocket de velas da Pocket Option.
@@ -211,6 +228,11 @@ class PocketOptionAPI(object):
             <pocketoptionapi.ws.channels.candles.GetCandles>`.
         """
         return GetCandles(self)
+
+    async def async_getcandles(self, active_id, interval, count, end_time):
+        """Versão assíncrona do getcandles"""
+        candles_instance = GetCandles(self)
+        await candles_instance.async_call(active_id, interval, count, end_time)
 
     @property
     def change_symbol(self):
@@ -225,8 +247,7 @@ class PocketOptionAPI(object):
     def synced_datetime(self):
         try:
             if self.time_sync is not None:
-                self.sync.synchronize(self.time_sync.server_timestamp)
-                self.sync_datetime = self.sync.get_synced_datetime()
+                self.sync_datetime = self.time_sync.server_datetime
             else:
                 logging.error("timesync não está definido")
                 self.sync_datetime = None
@@ -235,3 +256,52 @@ class PocketOptionAPI(object):
             self.sync_datetime = None
 
         return self.sync_datetime
+
+    async def async_connect(self):
+        """Método assíncrono para conexão com a API da Pocket Option."""
+        global_value.ssl_Mutual_exclusion = False
+        global_value.ssl_Mutual_exclusion_write = False
+
+        # Inicializa conexão WebSocket de forma assíncrona
+        global_value.websocket_is_connected = False
+        global_value.check_websocket_if_error = False
+        global_value.websocket_error_reason = None
+
+        # Conecta WebSocket
+        try:
+            await self.websocket.connect()
+            
+            # Aguarda conexão se estabelecer
+            timeout = 10  # 10 segundos timeout
+            start_time = time.time()
+            
+            while not global_value.websocket_is_connected and (time.time() - start_time) < timeout:
+                if global_value.check_websocket_if_error:
+                    raise Exception(global_value.websocket_error_reason)
+                await asyncio.sleep(0.1)
+            
+            if not global_value.websocket_is_connected:
+                raise Exception("Timeout na conexão WebSocket")
+                
+            # Aguarda sincronização de tempo
+            self.time_sync.server_timestamps = None
+            timeout = 5
+            start_time = time.time()
+            
+            while self.time_sync.server_timestamps is None and (time.time() - start_time) < timeout:
+                await asyncio.sleep(0.1)
+                
+            return True, None
+            
+        except Exception as e:
+            return False, str(e)
+
+    async def async_close(self):
+        """Método assíncrono para fechar conexão."""
+        try:
+            if hasattr(self.websocket, 'websocket') and self.websocket.websocket:
+                await self.websocket.websocket.close()
+            global_value.websocket_is_connected = False
+            logger.debug("🔌 Conexão WebSocket fechada pelo async_close")
+        except Exception as e:
+            logger.warning(f"⚠️ Aviso ao fechar conexão: {e}")

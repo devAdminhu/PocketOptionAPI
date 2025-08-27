@@ -40,3 +40,17 @@ class GetCandles(Base):
         data = ["loadHistoryPeriod", data]
 
         self.send_websocket_request(self.name, data)
+
+    async def async_call(self, active_id, interval, count, end_time):
+        """Versão assíncrona do método call para obter candles"""
+        data = {
+            "asset": str(active_id),
+            "index": end_time,
+            "offset": count,  # number of candles
+            "period": interval,
+            "time": end_time,  # time size sample:if interval set 1 mean get time 0~1 candle
+        }
+
+        data = ["loadHistoryPeriod", data]
+
+        await self.async_send_websocket_request(self.name, data)

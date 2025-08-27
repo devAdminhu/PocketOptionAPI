@@ -1,5 +1,19 @@
-from .api import PocketOptionAPI
+"""
+PocketOptionAPI - Python interface for PocketOption platform.
 
-__version__ = "0.1.0"
+Interface para a plataforma PocketOption.
 
-__all__ = ['PocketOptionAPI']
+Recursos:
+- Trading
+- Análise de dados de mercado
+- Dados históricos
+- WebSocket
+
+Autor: AdminhuDev
+Versão: 1.0.99
+"""
+
+from .stable_api import PocketOption
+
+__version__ = "1.0.99"
+__all__ = ['PocketOption']

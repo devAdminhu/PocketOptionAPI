@@ -34,6 +34,23 @@ class Buyv3(Base):
 
         self.send_websocket_request(self.name, message, str(request_id))
 
+    async def async_call(self, amount, active, direction, duration, request_id):
+        """Versão assíncrona do método call"""
+        # Construir o dicionário
+        data_dict = {
+            "asset": active,
+            "amount": amount,
+            "action": direction,
+            "isDemo": 1,
+            "requestId": request_id,
+            "optionType": 100,
+            "time": duration
+        }
+
+        message = ["openOrder", data_dict]
+
+        await self.async_send_websocket_request(self.name, message, str(request_id))
+
 
 class Buyv3_by_raw_expired(Base):
     name = "sendMessage"
